@@ -21,7 +21,6 @@ type bothJobTypes struct {
 	id           string
 	jobParserJob *Job
 	workflowJob  *model.Job
-	ignore       bool
 
 	overrideOnClause *yaml.Node
 }
@@ -106,10 +105,6 @@ func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWork
 
 	var ret []*SingleWorkflow
 	for _, bothJobs := range jobs {
-		if bothJobs.ignore {
-			continue
-		}
-
 		id := bothJobs.id
 		jobParserJob := bothJobs.jobParserJob
 		workflowJob := bothJobs.workflowJob
@@ -224,9 +219,6 @@ func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWork
 func expandReusableWorkflows(jobs []*bothJobTypes, validate bool, options []ParseOption, pc *parseContext, jobResults map[string]*JobResult) ([]*bothJobTypes, error) {
 	retval := []*bothJobTypes{}
 	for _, bothJobs := range jobs {
-		if bothJobs.ignore {
-			continue
-		}
 		workflowJob := bothJobs.workflowJob
 
 		jobType, err := workflowJob.Type()
@@ -261,11 +253,28 @@ func expandReusableWorkflows(jobs []*bothJobTypes, validate bool, options []Pars
 			reusableWorkflow = contents
 		}
 		if reusableWorkflow != nil {
-			bothJobs.ignore = true // drop the job that referenced the reusable workflow
 			newJobs, err := expandReusableWorkflow(reusableWorkflow, validate, options, pc, jobResults, bothJobs)
 			if err != nil {
 				return nil, fmt.Errorf("error expanding reusable workflow %q: %v", workflowJob.Uses, err)
 			}
+
+			// Append the inner jobs' IDs to the `needs` of the parent job.
+			additionalNeeds := make([]string, len(newJobs))
+			for i, b := range newJobs {
+				additionalNeeds[i] = b.id
+			}
+			calleeNeeds := bothJobs.jobParserJob.Needs()
+			calleeNeeds = append(calleeNeeds, additionalNeeds...)
+			_ = bothJobs.jobParserJob.RawNeeds.Encode(calleeNeeds)
+
+			// The "callee" job will still exist in order to act as a `sentinel` for `needs` job ordering & output
+			// access.  There may be some need for specialized detection of this case on the Forgejo side, but at the
+			// moment we'll just mark it as a job with `if: false` and remove the `uses: ...` to ensure that it never
+			// gets executed as its own reusable workflow.
+			_ = bothJobs.jobParserJob.If.Encode(false)
+			bothJobs.jobParserJob.Uses = ""
+			bothJobs.jobParserJob.With = nil
+
 			retval = append(retval, newJobs...)
 		}
 	}
@@ -307,8 +316,23 @@ func expandReusableWorkflow(contents []byte, validate bool, options []ParseOptio
 			return nil, fmt.Errorf("model.ReadWorkflow: %w", err)
 		}
 
+		originalNeeds := job.Needs()
+		newNeeds := make([]string, len(originalNeeds))
+		// Rewrite the `needs` of the job to be qualified within the job so they depend upon each other.
+		for i := range originalNeeds {
+			newNeeds[i] = fmt.Sprintf("%s.%s", calleeJob.id, originalNeeds[i])
+		}
+		// Add all the jobs that the reusable workflow `needs`'d to the jobs within the reusable workflow as well:
+		newNeeds = append(newNeeds, calleeJob.jobParserJob.Needs()...)
+		if len(newNeeds) != 0 {
+			err = job.RawNeeds.Encode(newNeeds)
+			if err != nil {
+				return nil, fmt.Errorf("error encoding newNeeds to yaml: %w", err)
+			}
+		}
+
 		retval = append(retval, &bothJobTypes{
-			id:               id,
+			id:               fmt.Sprintf("%s.%s", calleeJob.id, id),
 			jobParserJob:     job,
 			workflowJob:      workflow.GetJob(id),
 			overrideOnClause: rebuiltOn,
