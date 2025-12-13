@@ -1,6 +1,7 @@
 package jobparser
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"strings"
@@ -200,7 +201,7 @@ func TestParse(t *testing.T) {
 			reparsingSingleWorkflow: true,
 			options: []ParseOption{
 				WithInputs(map[string]any{
-					"callee-invalid-input": "this shouldn't appear in the reusable workflow",
+					"caller-invalid-input": "this shouldn't appear in the reusable workflow",
 				}),
 				ExpandLocalReusableWorkflows(func(path string) ([]byte, error) {
 					content := ReadTestdata(t, "expand_inputs_reusable.yaml", true)
@@ -230,6 +231,18 @@ func TestParse(t *testing.T) {
 					}
 					if path == "./.forgejo/workflows/expand_reusable_needs_recursive-2.yml" {
 						content := ReadTestdata(t, "expand_reusable_needs_recursive-2.yaml", true)
+						return content, nil
+					}
+					return nil, fmt.Errorf("unexpected local path: %q", path)
+				}),
+			},
+		},
+		{
+			name: "expand_reusable_outputs",
+			options: []ParseOption{
+				ExpandLocalReusableWorkflows(func(path string) ([]byte, error) {
+					if path == "./.forgejo/workflows/expand_reusable_outputs_reusable-1.yml" {
+						content := ReadTestdata(t, "expand_reusable_outputs_reusable-1.yaml", true)
 						return content, nil
 					}
 					return nil, fmt.Errorf("unexpected local path: %q", path)
@@ -303,9 +316,11 @@ jobs:
     steps: []
 `
 
+	workflow, err := model.ReadWorkflow(bytes.NewReader([]byte(testWorkflow)), true)
+	require.NoError(t, err)
+
 	inputs, rebuildInputs, err := evaluateReusableWorkflowInputs(
-		[]byte(testWorkflow),
-		true,
+		workflow,
 		&parseContext{
 			gitContext: &model.GithubContext{
 				EventName: "workflow_call",
@@ -330,7 +345,7 @@ jobs:
 					"context-needs":            "${{ needs.some-job.outputs.some-output }}",
 					"context-strategy":         "${{ strategy.fail-fast }}",
 					"context-vars":             "${{ vars.best-var }}",
-					// TODO: matrix evaluation of the callee job not yet supported
+					// TODO: matrix evaluation of the caller job not yet supported
 					// "context-matrix":           "${{ matrix.os }}",
 				},
 				Strategy: &model.Strategy{
@@ -352,7 +367,7 @@ jobs:
 	// Variable-accessing values passed in from `with: ...`
 	assert.Subset(t, inputs, map[string]any{"context-forgejo": "workflow_call"})
 	assert.Subset(t, inputs, map[string]any{"context-inputs": "my_input_value"})
-	// assert.Subset(t, inputs, map[string]any{"context-matrix":  "nixos"}), // matrix evaluation of the callee job not yet supported
+	// assert.Subset(t, inputs, map[string]any{"context-matrix":  "nixos"}), // matrix evaluation of the caller job not yet supported
 	assert.Subset(t, inputs, map[string]any{"context-needs": "some-output-value"})
 	assert.Subset(t, inputs, map[string]any{"context-strategy": true})
 	assert.Subset(t, inputs, map[string]any{"context-vars": "the-best-var"})
