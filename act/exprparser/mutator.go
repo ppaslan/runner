@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/rhysd/actionlint"
+	"go.yaml.in/yaml/v3"
 )
 
 // Given a workflow string which may contain an expression, apply an expression `Mutation` to the string and return a
@@ -33,9 +34,14 @@ func Mutate(input string, mutations ...Mutation) (string, error) {
 
 	// Mutate the AST.
 	mutator := &mutator{mutations}
-	newNode, err := mutator.mutate(exprNode)
+	newNode, mutationHasEffect, err := mutator.mutate(exprNode)
 	if err != nil {
 		return "", fmt.Errorf("failed to mutate: %w", err)
+	}
+	if !mutationHasEffect {
+		// Rewriting the expression and re-rendering it can cause minor syntax changes throughout that could be
+		// confusing.  If none of the mutations had any effect on the string, then abort and return the original.
+		return input, nil
 	}
 
 	// Render the new expression.
@@ -50,6 +56,61 @@ func Mutate(input string, mutations ...Mutation) (string, error) {
 	return builder.String(), nil
 }
 
+// Where `Mutate` operates on a single expression string, `MutateYamlNode` will iterate through an entire yaml tree and
+// perform the mutations on all string values found within.
+func MutateYamlNode(node *yaml.Node, mutations ...Mutation) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		return mutateScalarYamlNode(node, mutations...)
+	case yaml.MappingNode:
+		return mutateMappingYamlNode(node, mutations...)
+	case yaml.SequenceNode:
+		return mutateSequenceYamlNode(node, mutations...)
+	default:
+		return nil
+	}
+}
+
+func mutateScalarYamlNode(node *yaml.Node, mutations ...Mutation) error {
+	if node.ShortTag() != "!!str" {
+		return nil
+	}
+	var in string
+	if err := node.Decode(&in); err != nil {
+		return err
+	}
+	if !strings.Contains(in, "${{") || !strings.Contains(in, "}}") {
+		return nil
+	}
+	res, err := Mutate(in, mutations...)
+	if err != nil {
+		return err
+	}
+	return node.Encode(res)
+}
+
+func mutateMappingYamlNode(node *yaml.Node, mutations ...Mutation) error {
+	for i := 0; i < len(node.Content)/2; {
+		// k := node.Content[i*2]
+		v := node.Content[i*2+1]
+		if err := MutateYamlNode(v, mutations...); err != nil {
+			return err
+		}
+		i++
+	}
+	return nil
+}
+
+func mutateSequenceYamlNode(node *yaml.Node, mutations ...Mutation) error {
+	for i := range node.Content {
+		v := node.Content[i]
+		if err := MutateYamlNode(v, mutations...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Mutations are provided to `Mutate` to change an expression.
 type Mutation interface {
 	// Given a single AST node, return either `nil` to allow the original node to be used, or a new `ExprNode` to
@@ -61,113 +122,119 @@ type mutator struct {
 	mutations []Mutation
 }
 
-// Recursively rewrite the AST expression tree, applying the mutator's `mutations` as it is processed.
-func (m *mutator) mutate(exprNode actionlint.ExprNode) (actionlint.ExprNode, error) {
-	newNode, err := m.noopRewrite(exprNode)
+// Recursively rewrite the AST expression tree, applying the mutator's `mutations` as it is processed.  The new node, a
+// flag as to whether the mutation made any change, and possibly an error are returned.
+func (m *mutator) mutate(exprNode actionlint.ExprNode) (actionlint.ExprNode, bool, error) {
+	mutationHasEffect := false
+	newNode, innerMutationHasEffect, err := m.noopRewrite(exprNode)
 	for _, mutation := range m.mutations {
 		replacement, err := mutation.SingleNodeMutation(exprNode)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		} else if replacement != nil {
 			newNode = replacement
+			mutationHasEffect = true
 		}
 	}
-	return newNode, err
+	return newNode, mutationHasEffect || innerMutationHasEffect, err
 }
 
 // Create a copy of `exprNode` with the same data as the original node, applying mutations to all child nodes (function
-// arguments, etc.).
-func (m *mutator) noopRewrite(exprNode actionlint.ExprNode) (actionlint.ExprNode, error) {
+// arguments, etc.).  The new node, a flag as to whether the mutation made any change, and possibly an error are
+// returned.
+func (m *mutator) noopRewrite(exprNode actionlint.ExprNode) (actionlint.ExprNode, bool, error) {
 	switch node := exprNode.(type) {
 	case *actionlint.VariableNode:
-		return &actionlint.VariableNode{Name: node.Name}, nil
+		return &actionlint.VariableNode{Name: node.Name}, false, nil
 	case *actionlint.BoolNode:
-		return &actionlint.BoolNode{Value: node.Value}, nil
+		return &actionlint.BoolNode{Value: node.Value}, false, nil
 	case *actionlint.NullNode:
-		return &actionlint.NullNode{}, nil
+		return &actionlint.NullNode{}, false, nil
 	case *actionlint.IntNode:
-		return &actionlint.IntNode{Value: node.Value}, nil
+		return &actionlint.IntNode{Value: node.Value}, false, nil
 	case *actionlint.FloatNode:
-		return &actionlint.FloatNode{Value: node.Value}, nil
+		return &actionlint.FloatNode{Value: node.Value}, false, nil
 	case *actionlint.StringNode:
-		return &actionlint.StringNode{Value: node.Value}, nil
+		return &actionlint.StringNode{Value: node.Value}, false, nil
 	case *actionlint.IndexAccessNode:
-		newOperand, err := m.mutate(node.Operand)
+		newOperand, mutationHasEffect, err := m.mutate(node.Operand)
 		if err != nil {
-			return nil, fmt.Errorf("failure mutating IndexAccessNode operand: %w", err)
+			return nil, false, fmt.Errorf("failure mutating IndexAccessNode operand: %w", err)
 		}
 		return &actionlint.IndexAccessNode{
 			Operand: newOperand,
 			Index:   node.Index,
-		}, nil
+		}, mutationHasEffect, nil
 	case *actionlint.ObjectDerefNode:
-		newReceiver, err := m.mutate(node.Receiver)
+		newReceiver, mutationHasEffect, err := m.mutate(node.Receiver)
 		if err != nil {
-			return nil, fmt.Errorf("failure mutating ObjectDerefNode receiver: %w", err)
+			return nil, false, fmt.Errorf("failure mutating ObjectDerefNode receiver: %w", err)
 		}
 		return &actionlint.ObjectDerefNode{
 			Receiver: newReceiver,
 			Property: node.Property,
-		}, nil
+		}, mutationHasEffect, nil
 	case *actionlint.ArrayDerefNode:
-		newReceiver, err := m.mutate(node.Receiver)
+		newReceiver, mutationHasEffect, err := m.mutate(node.Receiver)
 		if err != nil {
-			return nil, fmt.Errorf("failure mutating ArrayDerefNode receiver: %w", err)
+			return nil, false, fmt.Errorf("failure mutating ArrayDerefNode receiver: %w", err)
 		}
 		return &actionlint.ArrayDerefNode{
 			Receiver: newReceiver,
-		}, nil
+		}, mutationHasEffect, nil
 	case *actionlint.NotOpNode:
-		newOperand, err := m.mutate(node.Operand)
+		newOperand, mutationHasEffect, err := m.mutate(node.Operand)
 		if err != nil {
-			return nil, fmt.Errorf("failure mutating NotOpNode operand: %w", err)
+			return nil, false, fmt.Errorf("failure mutating NotOpNode operand: %w", err)
 		}
 		return &actionlint.NotOpNode{
 			Operand: newOperand,
-		}, nil
+		}, mutationHasEffect, nil
 	case *actionlint.CompareOpNode:
-		newLeft, err := m.mutate(node.Left)
+		newLeft, mutationHasEffectLeft, err := m.mutate(node.Left)
 		if err != nil {
-			return nil, fmt.Errorf("failure mutating CompareOpNode left: %w", err)
+			return nil, false, fmt.Errorf("failure mutating CompareOpNode left: %w", err)
 		}
-		newRight, err := m.mutate(node.Right)
+		newRight, mutationHasEffectRight, err := m.mutate(node.Right)
 		if err != nil {
-			return nil, fmt.Errorf("failure mutating CompareOpNode right: %w", err)
+			return nil, false, fmt.Errorf("failure mutating CompareOpNode right: %w", err)
 		}
 		return &actionlint.CompareOpNode{
 			Left:  newLeft,
 			Right: newRight,
 			Kind:  node.Kind,
-		}, nil
+		}, mutationHasEffectLeft || mutationHasEffectRight, nil
 	case *actionlint.LogicalOpNode:
-		newLeft, err := m.mutate(node.Left)
+		newLeft, mutationHasEffectLeft, err := m.mutate(node.Left)
 		if err != nil {
-			return nil, fmt.Errorf("failure mutating CompareOpNode left: %w", err)
+			return nil, false, fmt.Errorf("failure mutating CompareOpNode left: %w", err)
 		}
-		newRight, err := m.mutate(node.Right)
+		newRight, mutationHasEffectRight, err := m.mutate(node.Right)
 		if err != nil {
-			return nil, fmt.Errorf("failure mutating CompareOpNode right: %w", err)
+			return nil, false, fmt.Errorf("failure mutating CompareOpNode right: %w", err)
 		}
 		return &actionlint.LogicalOpNode{
 			Left:  newLeft,
 			Right: newRight,
 			Kind:  node.Kind,
-		}, nil
+		}, mutationHasEffectLeft || mutationHasEffectRight, nil
 	case *actionlint.FuncCallNode:
 		newArgs := make([]actionlint.ExprNode, len(node.Args))
+		mutationHasEffect := false
 		for i, arg := range node.Args {
-			newArg, err := m.mutate(arg)
+			newArg, argMutated, err := m.mutate(arg)
+			mutationHasEffect = mutationHasEffect || argMutated
 			if err != nil {
-				return nil, fmt.Errorf("failure mutating FuncCallNode arg %d: %w", i, err)
+				return nil, false, fmt.Errorf("failure mutating FuncCallNode arg %d: %w", i, err)
 			}
 			newArgs[i] = newArg
 		}
 		return &actionlint.FuncCallNode{
 			Callee: node.Callee,
 			Args:   newArgs,
-		}, nil
+		}, mutationHasEffect, nil
 	default:
-		return nil, fmt.Errorf("unknown node type: %s node: %+v", reflect.TypeOf(exprNode), exprNode)
+		return nil, false, fmt.Errorf("unknown node type: %s node: %+v", reflect.TypeOf(exprNode), exprNode)
 	}
 }
 
