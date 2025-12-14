@@ -24,10 +24,17 @@ func TestParse(t *testing.T) {
 	defer func() { model.OnDecodeNodeError = origOnDecodeNodeError }()
 
 	tests := []struct {
-		name                    string
-		options                 []ParseOption
-		wantErr                 string
+		name    string
+		options []ParseOption
+		wantErr string
+
+		// If we're expecting {name}.in.yaml to be a SingleWorkflow, which has additional fields that a normal workflow
+		// doesn't have, then we can't validate the input as a workflow.
 		reparsingSingleWorkflow bool
+
+		// If we're expecting {name}.out.yaml to have additional fields (incomplete_*) that a normal workflow doesn't
+		// have, then we can't validate the output as a workflow.
+		expectingInvalidWorkflowOutput bool
 	}{
 		{
 			name:    "multiple_named_matrix",
@@ -273,6 +280,136 @@ func TestParse(t *testing.T) {
 				}),
 			},
 		},
+		// `expand_reusable_incomplete1` covers a test case where the caller of a reusable workflow has a `matrix` job
+		// that references `${{ needs... }}`, and therefore requires job outputs before it can be expanded.
+		{
+			name: "expand_reusable_incomplete1",
+			options: []ParseOption{
+				WithJobOutputs(map[string]map[string]string{}),
+				SupportIncompleteRunsOn(),
+				ExpandLocalReusableWorkflows(func(path string) ([]byte, error) {
+					if path == "./.forgejo/workflows/expand_reusable_incomplete1_reusable.yml" {
+						content := ReadTestdata(t, "expand_reusable_incomplete1_reusable.yaml", true)
+						return content, nil
+					}
+					return nil, fmt.Errorf("unexpected local path: %q", path)
+				}),
+			},
+		},
+		// `expand_reusable_incomplete1_complete` covers reparsing the incomplete workflow from
+		// `expand_reusable_incomplete1` after the `needs` is defined, allowing the matrix to be expanded.
+		{
+			name:                    "expand_reusable_incomplete1_complete",
+			reparsingSingleWorkflow: true,
+			options: []ParseOption{
+				WithWorkflowNeeds([]string{"define-runs-on"}),
+				WithJobOutputs(map[string]map[string]string{
+					"define-runs-on": {
+						"runners": "[\"runner-a\", \"runner-b\"]",
+					},
+				}),
+				SupportIncompleteRunsOn(),
+				ExpandLocalReusableWorkflows(func(path string) ([]byte, error) {
+					if path == "./.forgejo/workflows/expand_reusable_incomplete1_reusable.yml" {
+						content := ReadTestdata(t, "expand_reusable_incomplete1_reusable.yaml", true)
+						return content, nil
+					}
+					return nil, fmt.Errorf("unexpected local path: %q", path)
+				}),
+			},
+		},
+		// `expand_reusable_incomplete2` covers a test case where the caller of a reusable workflow has a `with`
+		// defining inputs for a reusable workflow that references `${{ needs... }}`, and therefore requires job outputs
+		// before it can be expanded.
+		{
+			name: "expand_reusable_incomplete2",
+			options: []ParseOption{
+				WithJobOutputs(map[string]map[string]string{}),
+				SupportIncompleteRunsOn(),
+				ExpandLocalReusableWorkflows(func(path string) ([]byte, error) {
+					if path == "./.forgejo/workflows/expand_reusable_incomplete2_reusable.yml" {
+						content := ReadTestdata(t, "expand_reusable_incomplete2_reusable.yaml", true)
+						return content, nil
+					}
+					return nil, fmt.Errorf("unexpected local path: %q", path)
+				}),
+			},
+		},
+		// `expand_reusable_incomplete2_complete` covers reparsing the incomplete workflow from
+		// `expand_reusable_incomplete2` after the `needs` is defined, allowing the `with` to be expanded.
+		{
+			name:                    "expand_reusable_incomplete2_complete",
+			reparsingSingleWorkflow: true,
+			options: []ParseOption{
+				WithWorkflowNeeds([]string{"define-with"}),
+				WithJobOutputs(map[string]map[string]string{
+					"define-with": {
+						"runner": "ubuntu-29.99",
+					},
+				}),
+				SupportIncompleteRunsOn(),
+				ExpandLocalReusableWorkflows(func(path string) ([]byte, error) {
+					if path == "./.forgejo/workflows/expand_reusable_incomplete2_reusable.yml" {
+						content := ReadTestdata(t, "expand_reusable_incomplete2_reusable.yaml", true)
+						return content, nil
+					}
+					return nil, fmt.Errorf("unexpected local path: %q", path)
+				}),
+			},
+		},
+		// `expand_reusable_incomplete3` covers accessing `${{ matrix.something }}` in a `with` clause for a reusable
+		// workflow when `something` isn't actually defined in the job's matrix.
+		{
+			name:                           "expand_reusable_incomplete3",
+			reparsingSingleWorkflow:        true,
+			expectingInvalidWorkflowOutput: true,
+			options: []ParseOption{
+				WithJobOutputs(map[string]map[string]string{}),
+				SupportIncompleteRunsOn(),
+				ExpandLocalReusableWorkflows(func(path string) ([]byte, error) {
+					if path == "./.forgejo/workflows/expand_reusable_incomplete3_reusable.yml" {
+						content := ReadTestdata(t, "expand_reusable_incomplete3_reusable.yaml", true)
+						return content, nil
+					}
+					return nil, fmt.Errorf("unexpected local path: %q", path)
+				}),
+			},
+		},
+		// `expand_reusable_incomplete4` tests a job within a reusable workflow being marked as incomplete because it
+		// has a dependency on another job within the same workflow, and therefore can't be fully evaluated yet at
+		// expansion time of the caller.  Specifically this case is a `runs-on: ${{ needs.other-local-job.outputs.blah
+		// }}`, but it is expected that no specialized handling is required between the two cases where this is
+		// supported (matrix, runs-on).
+		{
+			name: "expand_reusable_incomplete4",
+			options: []ParseOption{
+				WithJobOutputs(map[string]map[string]string{}),
+				SupportIncompleteRunsOn(),
+				ExpandLocalReusableWorkflows(func(path string) ([]byte, error) {
+					if path == "./.forgejo/workflows/expand_reusable_incomplete4_reusable.yml" {
+						content := ReadTestdata(t, "expand_reusable_incomplete4_reusable.yaml", true)
+						return content, nil
+					}
+					return nil, fmt.Errorf("unexpected local path: %q", path)
+				}),
+			},
+		},
+		// `expand_reusable_incomplete4_complete` covers reparsing the incomplete workflow from
+		// `expand_reusable_incomplete4` after the `needs` is defined, allowing the `with` to be expanded.
+		{
+			name:                           "expand_reusable_incomplete4_complete",
+			reparsingSingleWorkflow:        true,
+			expectingInvalidWorkflowOutput: true,
+			options: []ParseOption{
+				WithWorkflowNeeds([]string{"reusable.inner-define-runs-on"}),
+				WithJobOutputs(map[string]map[string]string{
+					"reusable.inner-define-runs-on": {
+						"runner": "ubuntu-29.99",
+					},
+				}),
+				SupportIncompleteRunsOn(),
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -284,7 +421,7 @@ func TestParse(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 
-				want := ReadTestdata(t, tt.name+".out.yaml", false)
+				want := ReadTestdata(t, tt.name+".out.yaml", tt.expectingInvalidWorkflowOutput)
 				builder := &strings.Builder{}
 				for _, v := range got {
 					if builder.Len() > 0 {

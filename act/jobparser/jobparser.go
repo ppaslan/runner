@@ -27,6 +27,9 @@ type bothJobTypes struct {
 	jobNeeds []string
 
 	overrideOnClause *yaml.Node
+
+	withInvalidJobReference    *exprparser.InvalidJobOutputReferencedError
+	withInvalidMatrixReference *exprparser.InvalidMatrixDimensionReferencedError
 }
 
 func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWorkflow, error) {
@@ -106,7 +109,7 @@ func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWork
 
 	// Expand reusable workflows `uses:...` into inner jobs:
 	if pc.localWorkflowFetcher != nil || pc.remoteWorkflowFetcher != nil {
-		newJobs, err := expandReusableWorkflows(postMatrixJobs, validate, options, pc, results)
+		newJobs, err := expandReusableWorkflows(postMatrixJobs, validate, incompleteMatrix, options, pc, results)
 		if err != nil {
 			return nil, err
 		}
@@ -175,6 +178,19 @@ func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWork
 			swf.IncompleteRunsOn = true
 			swf.IncompleteRunsOnMatrix = &IncompleteMatrix{
 				Dimension: runsOnInvalidMatrixReference.Dimension,
+			}
+		}
+		if bothJobs.withInvalidJobReference != nil {
+			swf.IncompleteWith = true
+			swf.IncompleteWithNeeds = &IncompleteNeeds{
+				Job:    bothJobs.withInvalidJobReference.JobID,
+				Output: bothJobs.withInvalidJobReference.OutputName,
+			}
+		}
+		if bothJobs.withInvalidMatrixReference != nil {
+			swf.IncompleteWith = true
+			swf.IncompleteWithMatrix = &IncompleteMatrix{
+				Dimension: bothJobs.withInvalidMatrixReference.Dimension,
 			}
 		}
 		if err := swf.SetJob(id, job); err != nil {
@@ -251,9 +267,14 @@ func expandMatrixJobs(jobs []*bothJobTypes, incompleteMatrix map[string]*exprpar
 	return retval, nil
 }
 
-func expandReusableWorkflows(jobs []*bothJobTypes, validate bool, options []ParseOption, pc *parseContext, jobResults map[string]*JobResult) ([]*bothJobTypes, error) {
+func expandReusableWorkflows(jobs []*bothJobTypes, validate bool, incompleteMatrix map[string]*exprparser.InvalidJobOutputReferencedError, options []ParseOption, pc *parseContext, jobResults map[string]*JobResult) ([]*bothJobTypes, error) {
 	retval := []*bothJobTypes{}
 	for _, bothJobs := range jobs {
+		if _, incomplete := incompleteMatrix[bothJobs.id]; incomplete {
+			// Don't attempt to expand a reusable workflow when the caller doesn't have a fully evaluated matrix yet.
+			continue
+		}
+
 		workflowJob := bothJobs.workflowJob
 
 		jobType, err := workflowJob.Type()
@@ -288,27 +309,44 @@ func expandReusableWorkflows(jobs []*bothJobTypes, validate bool, options []Pars
 			reusableWorkflow = contents
 		}
 		if reusableWorkflow != nil {
+			// If we encounter an InvalidJobOutputReferencedError error, we'll know that this is caused by a `with:`
+			// clause referencing a job output that isn't present yet.  In this case, don't expand the job, but provide
+			// the error back in `bothJobTypes` so that it can be returned in the `SingleWorkflow`.
+			var withInvalidJobReference *exprparser.InvalidJobOutputReferencedError
+			// Same type of error, but for accessing an invalid matrix during `with:`.
+			var withInvalidMatrixReference *exprparser.InvalidMatrixDimensionReferencedError
+
 			newJobs, err := expandReusableWorkflow(reusableWorkflow, validate, options, pc, jobResults, bothJobs.matrix, bothJobs)
 			if err != nil {
-				return nil, fmt.Errorf("error expanding reusable workflow %q: %v", workflowJob.Uses, err)
+				errors.As(err, &withInvalidJobReference)
+				errors.As(err, &withInvalidMatrixReference)
+				if withInvalidJobReference == nil && withInvalidMatrixReference == nil {
+					return nil, fmt.Errorf("error expanding reusable workflow %q: %v", workflowJob.Uses, err)
+				}
 			}
 
-			// Append the inner jobs' IDs to the `needs` of the parent job.
-			additionalNeeds := make([]string, len(newJobs))
-			for i, b := range newJobs {
-				additionalNeeds[i] = b.id
-			}
-			callerNeeds := bothJobs.jobParserJob.Needs()
-			callerNeeds = append(callerNeeds, additionalNeeds...)
-			_ = bothJobs.jobParserJob.RawNeeds.Encode(callerNeeds)
+			if withInvalidJobReference == nil && withInvalidMatrixReference == nil {
+				// Append the inner jobs' IDs to the `needs` of the parent job.
+				additionalNeeds := make([]string, len(newJobs))
+				for i, b := range newJobs {
+					additionalNeeds[i] = b.id
+				}
+				callerNeeds := bothJobs.jobParserJob.Needs()
+				callerNeeds = append(callerNeeds, additionalNeeds...)
+				_ = bothJobs.jobParserJob.RawNeeds.Encode(callerNeeds)
 
-			// The calling job will still exist in order to act as a `sentinel` for `needs` job ordering & output
-			// access. There may be some need for specialized detection of this case on the Forgejo side, but at the
-			// moment we'll just mark it as a job with `if: false` and remove the `uses: ...` to ensure that it never
-			// gets executed as its own reusable workflow.
-			_ = bothJobs.jobParserJob.If.Encode(false)
-			bothJobs.jobParserJob.Uses = ""
-			bothJobs.jobParserJob.With = nil
+				// The calling job will still exist in order to act as a `sentinel` for `needs` job ordering & output
+				// access. There may be some need for specialized detection of this case on the Forgejo side, but at the
+				// moment we'll just mark it as a job with `if: false` and remove the `uses: ...` to ensure that it never
+				// gets executed as its own reusable workflow.
+				_ = bothJobs.jobParserJob.If.Encode(false)
+				bothJobs.jobParserJob.Uses = ""
+				bothJobs.jobParserJob.With = nil
+			} else {
+				// Retain all the original data of the job until it's really expanded, with its inputs, later
+				bothJobs.withInvalidJobReference = withInvalidJobReference
+				bothJobs.withInvalidMatrixReference = withInvalidMatrixReference
+			}
 
 			retval = append(retval, newJobs...)
 		}
