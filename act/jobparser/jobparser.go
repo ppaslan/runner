@@ -2,6 +2,8 @@ package jobparser
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -32,6 +34,8 @@ type bothJobTypes struct {
 	withInvalidMatrixReference *exprparser.InvalidMatrixDimensionReferencedError
 	internalIncompleteState    *SingleWorkflow
 	workflowCallInputs         map[string]any
+	workflowCallID             string
+	workflowCallParent         string
 }
 
 func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWorkflow, error) {
@@ -52,8 +56,11 @@ func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWork
 	if pc.recursionDepth > 5 {
 		return nil, fmt.Errorf("failed to parse workflow due to exceeding the workflow recursion limit (5)")
 	}
-	if workflow.IncompleteRecursionDepth != 0 {
-		pc.recursionDepth = workflow.IncompleteRecursionDepth
+	if workflow.Metadata.IncompleteRecursionDepth != 0 {
+		pc.recursionDepth = workflow.Metadata.IncompleteRecursionDepth
+	}
+	if workflow.Metadata.WorkflowCallID != "" {
+		pc.parentUniqueID = workflow.Metadata.WorkflowCallID
 	}
 
 	results := map[string]*JobResult{}
@@ -122,6 +129,7 @@ func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWork
 	}
 
 	var ret []*SingleWorkflow
+	emittingWorkflowCallID := map[string]bool{}
 	for _, bothJobs := range postMatrixJobs {
 		id := bothJobs.id
 		job := bothJobs.jobParserJob
@@ -155,13 +163,26 @@ func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWork
 			}
 		}
 
+		// Safety check -- verify that we never emit two jobs with the same WorkflowCallID
+		if bothJobs.workflowCallID != "" {
+			_, exists := emittingWorkflowCallID[bothJobs.workflowCallID]
+			if exists {
+				return nil, fmt.Errorf("attempted to emit multiple jobs with workflowCallID = %q", bothJobs.workflowCallID)
+			}
+			emittingWorkflowCallID[bothJobs.workflowCallID] = true
+		}
+
 		job.RawRunsOn = encodeRunsOn(runsOn)
 		swf := &SingleWorkflow{
-			Name:               workflow.Name,
-			RawOn:              workflow.RawOn,
-			Env:                workflow.Env,
-			Defaults:           workflow.Defaults,
-			WorkflowCallInputs: bothJobs.workflowCallInputs,
+			Name:     workflow.Name,
+			RawOn:    workflow.RawOn,
+			Env:      workflow.Env,
+			Defaults: workflow.Defaults,
+			Metadata: SingleWorkflowMetadata{
+				WorkflowCallInputs: bothJobs.workflowCallInputs,
+				WorkflowCallID:     bothJobs.workflowCallID,
+				WorkflowCallParent: bothJobs.workflowCallParent,
+			},
 		}
 		if bothJobs.overrideOnClause != nil {
 			swf.RawOn = *bothJobs.overrideOnClause
@@ -219,10 +240,14 @@ func Parse(content []byte, validate bool, options ...ParseOption) ([]*SingleWork
 			}
 		}
 		if swf.IncompleteMatrix || swf.IncompleteRunsOn || swf.IncompleteWith {
+			var incompleteRecursionDepth *int
 			if bothJobs.internalIncompleteState != nil {
-				swf.IncompleteRecursionDepth = bothJobs.internalIncompleteState.IncompleteRecursionDepth
+				incompleteRecursionDepth = &bothJobs.internalIncompleteState.Metadata.IncompleteRecursionDepth
 			} else {
-				swf.IncompleteRecursionDepth = pc.recursionDepth
+				incompleteRecursionDepth = &pc.recursionDepth
+			}
+			if incompleteRecursionDepth != nil {
+				swf.Metadata.IncompleteRecursionDepth = *incompleteRecursionDepth
 			}
 		}
 		if err := swf.SetJob(id, job); err != nil {
@@ -348,6 +373,9 @@ func expandReusableWorkflows(jobs []*bothJobTypes, validate bool, incompleteMatr
 			// Same type of error, but for accessing an invalid matrix during `with:`.
 			var withInvalidMatrixReference *exprparser.InvalidMatrixDimensionReferencedError
 
+			workflowParent := generateWorkflowCallID(pc.parentUniqueID, bothJobs.id, bothJobs.matrix)
+			bothJobs.workflowCallID = workflowParent
+
 			newJobs, err := expandReusableWorkflow(reusableWorkflow, validate, options, pc, jobResults, bothJobs.matrix, bothJobs)
 			if err != nil {
 				errors.As(err, &withInvalidJobReference)
@@ -368,9 +396,7 @@ func expandReusableWorkflows(jobs []*bothJobTypes, validate bool, incompleteMatr
 				_ = bothJobs.jobParserJob.RawNeeds.Encode(callerNeeds)
 
 				// The calling job will still exist in order to act as a `sentinel` for `needs` job ordering & output
-				// access. There may be some need for specialized detection of this case on the Forgejo side, but at the
-				// moment we'll just mark it as a job with `if: false` and remove the `uses: ...` to ensure that it never
-				// gets executed as its own reusable workflow.
+				// access. We'll take away the job's content to ensure nothing is actually executed.
 				_ = bothJobs.jobParserJob.If.Encode(false)
 				bothJobs.jobParserJob.Uses = ""
 				bothJobs.jobParserJob.With = nil
@@ -389,6 +415,7 @@ func expandReusableWorkflows(jobs []*bothJobTypes, validate bool, incompleteMatr
 func expandReusableWorkflow(contents []byte, validate bool, options []ParseOption, pc *parseContext, jobResults map[string]*JobResult, matrix map[string]any, callerJob *bothJobTypes) ([]*bothJobTypes, error) {
 	innerParseOptions := append([]ParseOption{}, options...) // copy original slice
 	innerParseOptions = append(innerParseOptions, withRecursionDepth(pc.recursionDepth+1))
+	innerParseOptions = append(innerParseOptions, withParentUniqueID(callerJob.workflowCallID))
 
 	workflow, err := model.ReadWorkflow(bytes.NewReader(contents), validate)
 	if err != nil {
@@ -459,6 +486,15 @@ func expandReusableWorkflow(contents []byte, validate bool, options []ParseOptio
 			jobParserJob:     job,
 			workflowJob:      workflow.GetJob(id),
 			overrideOnClause: rebuiltOn,
+
+			workflowCallParent: callerJob.workflowCallID,
+		}
+		// Maintain existing ID / Parent if populated in a lower-level recursive workflow call
+		if swf.Metadata.WorkflowCallID != "" {
+			newEntry.workflowCallID = swf.Metadata.WorkflowCallID
+		}
+		if swf.Metadata.WorkflowCallParent != "" {
+			newEntry.workflowCallParent = swf.Metadata.WorkflowCallParent
 		}
 		if swf.IncompleteMatrix || swf.IncompleteRunsOn || swf.IncompleteWith {
 			newEntry.internalIncompleteState = swf
@@ -705,6 +741,12 @@ func withRecursionDepth(depth int) ParseOption {
 	}
 }
 
+func withParentUniqueID(parentWorkflowCallID string) ParseOption {
+	return func(c *parseContext) {
+		c.parentUniqueID = parentWorkflowCallID
+	}
+}
+
 type parseContext struct {
 	jobResults              map[string]string
 	jobOutputs              map[string]map[string]string // map job ID -> output key -> output value
@@ -716,6 +758,7 @@ type parseContext struct {
 	localWorkflowFetcher    func(path string) ([]byte, error)
 	remoteWorkflowFetcher   func(ref *model.RemoteReusableWorkflowWithBaseURL) ([]byte, error)
 	recursionDepth          int
+	parentUniqueID          string
 }
 
 type ParseOption func(c *parseContext)
@@ -774,4 +817,28 @@ func matrixName(m map[string]any) string {
 	}
 
 	return fmt.Sprintf("(%s)", strings.Join(vs, ", "))
+}
+
+func generateWorkflowCallID(parentJobID, jobID string, matrix map[string]any) string {
+	h := sha256.New()
+	h.Write([]byte(parentJobID))
+	h.Write([]byte{0})
+	h.Write([]byte(jobID))
+	h.Write([]byte{0})
+
+	// Write `matrix` to the sha256, but ensure it's in deterministic order:
+	keys := make([]string, 0, len(matrix))
+	for k := range matrix {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		v, _ := yaml.Marshal(matrix[k])
+		h.Write(v)
+		h.Write([]byte{0})
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
 }
