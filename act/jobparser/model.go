@@ -1,6 +1,7 @@
 package jobparser
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -173,6 +174,10 @@ func (j *Job) RunsOn() []string {
 	return (&model.Job{RawRunsOn: j.RawRunsOn}).RunsOn()
 }
 
+func (j *Job) InheritSecrets() bool {
+	return (&model.Job{RawSecrets: j.RawSecrets}).InheritSecrets()
+}
+
 type Step struct {
 	ID               string            `yaml:"id,omitempty"`
 	If               yaml.Node         `yaml:"if,omitempty"`
@@ -249,7 +254,7 @@ func (evt *Event) Schedules() []map[string]string {
 // returned concurrency group will be "" and cancel-in-progress will be nil -- this can be used to distinguish from an
 // explicit cancel-in-progress choice even if a group isn't specified.
 func EvaluateWorkflowConcurrency(rc *model.RawConcurrency, gitCtx *model.GithubContext, vars map[string]string, inputs map[string]any) (string, *bool, error) {
-	evaluator := NewExpressionEvaluator(NewWorkflowInterpreter(gitCtx, vars, inputs))
+	evaluator := newExpressionEvaluator(newWorkflowInterpreter(gitCtx, vars, inputs))
 	var node yaml.Node
 	if err := node.Encode(rc); err != nil {
 		return "", nil, fmt.Errorf("failed to encode concurrency: %w", err)
@@ -449,8 +454,7 @@ func EvaluateWorkflowCallOutputs(callerWorkflow *SingleWorkflow, gitCtx *model.G
 		}
 	}
 
-	evaluator := NewExpressionEvaluator(newWorkflowCallOutputsInterpreter(gitCtx, vars, results, needs, callerWorkflow.Metadata.WorkflowCallInputs))
-
+	evaluator := newExpressionEvaluator(newWorkflowCallOutputsInterpreter(gitCtx, vars, results, needs, callerWorkflow.Metadata.WorkflowCallInputs))
 	_, callerJob := callerWorkflow.Job()
 
 	outputs := map[string]string{}
@@ -458,4 +462,68 @@ func EvaluateWorkflowCallOutputs(callerWorkflow *SingleWorkflow, gitCtx *model.G
 		outputs[key] = evaluator.Interpolate(value)
 	}
 	return outputs
+}
+
+type EvaluateWorkflowCallSecretsArgs struct {
+	CallerWorkflow *SingleWorkflow
+	GitCtx         *model.GithubContext
+	Vars           map[string]string
+	Needs          []string
+	JobInputs      map[string]any
+	JobResults     map[string]string
+	JobOutputs     map[string]map[string]string
+	CallerSecrets  map[string]string
+}
+
+// `jobs.<job_id>.secrets` may be a map of evaluatable expressions that will be put into the `secrets` context when a
+// reusable workflow is executed.  When using workflow expansion, Forgejo is responsible for scheduling reusable
+// workflow jobs and needs to be able to evaluate the secrets that will be passed into the reusable workflows' jobs;
+// `EvaluateWorkflowCallSecrets` provides that capability.
+func EvaluateWorkflowCallSecrets(args *EvaluateWorkflowCallSecretsArgs) map[string]string {
+	// Documented supported contexts for `jobs.<job_id>.secrets`: forgejo, inputs, matrix, needs, secrets, strategy,
+	// vars; need to gather all those data points and configure an evaluator for them.
+
+	jobID, _ := args.CallerWorkflow.Job()
+	content, _ := args.CallerWorkflow.Marshal()
+	workflow, _ := model.ReadWorkflow(bytes.NewReader(content), false)
+	modelJob := workflow.GetJob(jobID)
+
+	// Strategy values aren't initialized from unmarshal; needs to be done here
+	if modelJob.Strategy != nil {
+		modelJob.Strategy.FailFast = modelJob.Strategy.GetFailFast()
+		modelJob.Strategy.MaxParallel = modelJob.Strategy.GetMaxParallel()
+	}
+
+	matrixes, _ := getMatrixes(modelJob)
+	var jobMatrix map[string]any
+	if len(matrixes) == 1 { // as a SingleWorkflow, it should be either 0 (no matrix) or 1
+		jobMatrix = matrixes[0]
+	}
+
+	results := map[string]*JobResult{}
+	for _, id := range args.Needs {
+		results[id] = &JobResult{
+			Result:  args.JobResults[id],
+			Outputs: args.JobOutputs[id],
+		}
+	}
+	eval := newExpressionEvaluator(newInterpreter(
+		jobID,
+		modelJob,
+		jobMatrix,
+		args.GitCtx,
+		results,
+		args.Vars,
+		args.JobInputs,
+		0, // error mode none
+		args.Needs,
+		args.CallerSecrets,
+	))
+	secrets := map[string]string{}
+	for key, value := range modelJob.Secrets() {
+		// secrets are intended to be case-insensitive and Forgejo stores them uppercase no matter what -- generate them
+		// as uppercase names to be consistent with that
+		secrets[strings.ToUpper(key)] = eval.Interpolate(value)
+	}
+	return secrets
 }
