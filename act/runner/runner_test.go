@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -199,6 +200,7 @@ func (j *TestJobFileInfo) runTest(ctx context.Context, t *testing.T, cfg *Config
 		Matrix:                cfg.Matrix,
 		JobLoggerLevel:        cfg.JobLoggerLevel,
 		ContainerDaemonSocket: os.Getenv("DOCKER_HOST"),
+		ValidVolumes:          cfg.ValidVolumes,
 	}
 	if cfg.GitHubInstance != "" {
 		runnerConfig.GitHubInstance = cfg.GitHubInstance
@@ -289,11 +291,6 @@ func TestRunner_RunEvent(t *testing.T) {
 		{workdir, "fail", "push", "Job 'build' failed", platforms, secrets},
 		{workdir, "runs-on", "push", "", platforms, secrets},
 		{workdir, "checkout", "push", "", platforms, secrets},
-		{workdir, "job-container", "push", "", platforms, secrets},
-		{workdir, "job-container-non-root", "push", "", platforms, secrets},
-		{workdir, "job-container-invalid-credentials", "push", "failed to handle credentials: failed to interpolate container.credentials.password", platforms, secrets},
-		{workdir, "job-container-env-reference", "push", "", platforms, map[string]string{"ALPINE_TAG": "3.22"}},
-		{workdir, "container-hostname", "push", "", platforms, secrets},
 		{workdir, "remote-action-docker", "push", "", platforms, secrets},
 		{workdir, "remote-action-js", "push", "", platforms, secrets},
 		// {workdir, "remote-action-js-node-user", "push", "", platforms, secrets}, // Test if this works with non root container
@@ -341,6 +338,14 @@ func TestRunner_RunEvent(t *testing.T) {
 		{workdir, "no-panic-on-invalid-composite-action", "push", "missing steps in composite action", platforms, secrets},
 		{workdir, "stepsummary", "push", "", platforms, secrets},
 		{workdir, "tool-cache", "push", "", platforms, secrets},
+
+		// job container
+		{workdir, "job-container", "push", "", platforms, secrets},
+		{workdir, "job-container-env", "push", "", platforms, secrets},
+		{workdir, "job-container-image", "push", "", platforms, map[string]string{"ALPINE_TAG": "3.22"}},
+		{workdir, "job-container-invalid-credentials", "push", "failed to handle credentials: failed to interpolate container.credentials.password", platforms, secrets},
+		{workdir, "job-container-non-root", "push", "", platforms, secrets},
+		{workdir, "job-container-options", "push", "", platforms, secrets},
 
 		// services
 		{workdir, "services", "push", "", platforms, secrets},
@@ -812,4 +817,27 @@ func TestRunner_ReusableWorkflowGitHubInstance(t *testing.T) {
 			tjfi.runTest(t.Context(), t, &Config{GitHubInstance: gitHubInstance})
 		})
 	}
+}
+
+func TestRunner_JobContainerVolumes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	skip.If(t, runtime.GOOS != "linux") // Windows and macOS cannot run linux docker container natively
+
+	tempDir := t.TempDir()
+	volumePath := path.Join(tempDir, "file.txt")
+	err := os.WriteFile(volumePath, []byte("hello"), 0o644)
+	require.NoError(t, err)
+
+	jobFile := TestJobFileInfo{
+		workdir:      workdir,
+		workflowPath: "job-container-volumes",
+		eventName:    "push",
+		errorMessage: "",
+		platforms:    platforms,
+	}
+
+	config := &Config{Env: map[string]string{"volume_path": volumePath}, ValidVolumes: []string{volumePath}}
+	jobFile.runTest(t.Context(), t, config)
 }
