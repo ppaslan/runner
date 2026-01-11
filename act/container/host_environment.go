@@ -13,9 +13,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
+	"github.com/djherbis/buffer"
+	"github.com/djherbis/nio/v3"
 	"github.com/go-git/go-billy/v5/helper/polyfill"
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
@@ -189,28 +191,6 @@ func (e *HostEnvironment) Start(_ bool) common.Executor {
 	}
 }
 
-type ptyWriter struct {
-	Out       io.Writer
-	AutoStop  atomic.Bool
-	dirtyLine bool
-}
-
-func (w *ptyWriter) Write(buf []byte) (int, error) {
-	if w.AutoStop.Load() && len(buf) > 0 && buf[len(buf)-1] == 4 {
-		n, err := w.Out.Write(buf[:len(buf)-1])
-		if err != nil {
-			return n, err
-		}
-		if w.dirtyLine || len(buf) > 1 && buf[len(buf)-2] != '\n' {
-			_, _ = w.Out.Write([]byte("\n"))
-			return n, io.EOF
-		}
-		return n, io.EOF
-	}
-	w.dirtyLine = strings.LastIndex(string(buf), "\n") < len(buf)-1
-	return w.Out.Write(buf)
-}
-
 type localEnv struct {
 	env map[string]string
 }
@@ -240,40 +220,56 @@ func lookupPathHost(cmd string, env map[string]string, writer io.Writer) (string
 }
 
 func setupPty(cmd *exec.Cmd) (*os.File, *os.File, error) {
-	ppty, tty, err := openPty()
+	master, slave, err := openPty()
 	if err != nil {
 		return nil, nil, err
 	}
-	if term.IsTerminal(int(tty.Fd())) {
-		_, err := term.MakeRaw(int(tty.Fd()))
+	if term.IsTerminal(int(slave.Fd())) {
+		_, err := term.MakeRaw(int(slave.Fd()))
 		if err != nil {
-			ppty.Close()
-			tty.Close()
+			master.Close()
+			slave.Close()
 			return nil, nil, err
 		}
 	}
-	cmd.Stdin = tty
-	cmd.Stdout = tty
-	cmd.Stderr = tty
-	return ppty, tty, nil
+	cmd.Stdin = slave
+	cmd.Stdout = slave
+	cmd.Stderr = slave
+	return master, slave, nil
 }
 
-func writeKeepAlive(ppty io.Writer) {
-	c := 1
-	var err error
-	for c == 1 && err == nil {
-		c, err = ppty.Write([]byte{4})
-		<-time.After(time.Second)
-	}
-}
+func copyPtyOutput(writer io.Writer, master io.Reader, finishLog context.CancelFunc) {
+	// Writing to `writer` can be relatively slow; when forgejo-runner is in daemon mode then `writer` is `lineWriter`
+	// which will split the contents up line-by-line and call a lineHandler, which will send the output to a logger,
+	// which will end up in `Reporter` which acquires a mutex for each line received in order to append the line to its
+	// internal buffers.  Experimentally, when using an LXC command and PTY configuration, if a command outputs a large
+	// log chunk (~500kB), a straight `io.Copy()` between `master` and `reader` will end up with data being lost in
+	// chunks in random places in the log -- sometimes the middle, sometimes the end.  The cause of this is that the PTY
+	// has a fixed kernel data buffer, lxc-attach performs non-blocking I/O against the pty, and does not attempt to
+	// recover missing data from a "short write" if the buffer is full
+	// (https://github.com/lxc/lxc/blob/cba4ce7ef2ec09176de0aaca80f94636bcffabf2/src/lxc/terminal.c#L351-L352).
+	//
+	// Introducing a memory buffer in forgejo-runner helps to address this problem.  We read as fast as possible in a
+	// dedicated goroutine into the buffer, attempting to keep the PTY buffer clear and ready for writes from the
+	// subcommand.  Concurrently, we drain that buffer into `writer`.
+	//
+	// There's no limit to the buffer size that could be required to get this right and always guarantee all data.  A 2
+	// MB buffer was sufficient to meet the needs of reproduction test cases, but this has been bumped up to 100 MB for
+	// anticipated real-world use cases.  `buffer.New(x)` is allocated on-demand, so 100 MB is a maximum buffer size.
 
-func copyPtyOutput(writer io.Writer, ppty io.Reader, finishLog context.CancelFunc) {
-	defer func() {
-		finishLog()
-	}()
-	if _, err := io.Copy(writer, ppty); err != nil {
-		return
-	}
+	pipeReader, pipeWriter := nio.Pipe(buffer.New(100 * 1024 * 1024))
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		// Error is expected -- "read /dev/ptmx: input/output error" is the typical exit for io.Copy here.
+		_, _ = io.Copy(pipeWriter, master)
+		pipeWriter.Close()
+	})
+	wg.Go(func() {
+		_, _ = io.Copy(writer, pipeReader)
+	})
+	wg.Wait()
+
+	finishLog()
 }
 
 func (e *HostEnvironment) UpdateFromImageEnv(_ *map[string]string) common.Executor {
@@ -333,49 +329,42 @@ func (e *HostEnvironment) exec(ctx context.Context, commandparam []string, cmdli
 	cmd.Env = envList
 	cmd.Stderr = e.StdOut
 	cmd.Dir = wd
-	var ppty *os.File
-	var tty *os.File
+
+	var master *os.File
+	var slave *os.File
 	defer func() {
-		if ppty != nil {
-			ppty.Close()
+		if master != nil {
+			master.Close()
 		}
-		if tty != nil {
-			tty.Close()
+		if slave != nil {
+			slave.Close()
 		}
 	}()
 	if true /* allocate Terminal */ {
 		var err error
-		ppty, tty, err = setupPty(cmd)
+		master, slave, err = setupPty(cmd)
 		if err != nil {
 			common.Logger(ctx).Debugf("Failed to setup Pty %v\n", err.Error())
 		}
 	}
-	writer := &ptyWriter{Out: e.StdOut}
+
 	logctx, finishLog := context.WithCancel(context.Background())
-	if ppty != nil {
-		go copyPtyOutput(writer, ppty, finishLog)
+	if master != nil {
+		go copyPtyOutput(e.StdOut, master, finishLog)
 	} else {
 		finishLog()
 	}
-	if ppty != nil {
-		go writeKeepAlive(ppty)
-	}
-	err = runCmdInGroup(cmd, cmdline, tty != nil)
-	if err != nil {
+
+	if err := runCmdInGroup(cmd, cmdline, master != nil); err != nil {
 		return fmt.Errorf("RUN %w", err)
 	}
-	if tty != nil {
-		writer.AutoStop.Store(true)
-		if _, err := tty.Write([]byte("\x04")); err != nil {
-			common.Logger(ctx).Debug("Failed to write EOT")
-		}
+
+	if slave != nil {
+		_ = slave.Close()
 	}
+
 	<-logctx.Done()
 
-	if ppty != nil {
-		ppty.Close()
-		ppty = nil
-	}
 	return err
 }
 
