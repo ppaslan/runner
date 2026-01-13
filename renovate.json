@@ -25,6 +25,7 @@
   "customManagers": [
     {
       "description": "Update NodeJs in `act/runner/run_context.go`",
+      "customType": "regex",
       "managerFilePatterns": ["act/runner/run_context.go"],
       "matchStrings": ["NODE_MAJOR=(?<currentValue>\\d+)"],
       "datasourceTemplate": "node-version",
