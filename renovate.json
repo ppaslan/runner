@@ -15,6 +15,11 @@
       "separateMultipleMinor": true
     },
     {
+      "description":"separate major updates for lxc nodejs version",
+      "matchFileNames": ["act/runner/run_context.go"],
+      "separateMultipleMajor": true
+    },
+    {
       "description": "group runner updates",
       "matchDepNames": ["code.forgejo.org/forgejo/runner", "forgejo/runner"],
       "groupName": "forgejo-runner"
