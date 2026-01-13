@@ -21,5 +21,14 @@
     }
   ],
   "labels": ["Kind/DependencyUpdate", "run-end-to-end-tests"],
-  "ignorePaths": ["**/testdata/**", "**/node_modules/**"]
+  "ignorePaths": ["**/testdata/**", "**/node_modules/**"],
+  "customManagers": [
+    {
+      "description": "Update NodeJs in `act/runner/run_context.go`",
+      "managerFilePatterns": ["act/runner/run_context.go"],
+      "matchStrings": ["NODE_MAJOR=(?<currentValue>\\d+)"],
+      "datasourceTemplate": "node-version",
+      "depNameTemplate": "node"
+    }
+  ]
 }
