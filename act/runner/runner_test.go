@@ -849,3 +849,101 @@ func TestRunner_JobContainerVolumes(t *testing.T) {
 	config := &Config{Env: map[string]string{"volume_path": volumePath}, ValidVolumes: []string{volumePath}}
 	jobFile.runTest(t.Context(), t, config)
 }
+
+func TestRunner_DockerActionWithPreAndPostLocal(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	skip.If(t, runtime.GOOS != "linux") // Windows and macOS cannot run linux docker container natively
+
+	expectedLogMessages := []string{
+		// stage=Pre
+		// NOTE The pre step is not possible to run for a local actions, since the declartion is first available in the main stage after checkout
+		// TODO Create a warning if a user is triggering a local action with a pre-entrypoint
+
+		// stage=Main
+		// Message from ./testdata/actions/docker-local-with-post-entrypoint/entrypoint.sh
+		`msg="hello entrypoint\n" dryrun=false job=docker-with-pre-post/local jobID=local matrix="map[]" raw_output=true stage=Main`,
+		// Message from the runner
+		`msg="  ✅  Success - Main ./actions/docker-local-with-post-entrypoint" dryrun=false job=docker-with-pre-post/local jobID=local matrix="map[]" stage=Main`,
+
+		// stage=Post
+		// Message from ./testdata/actions/docker-local-with-post-entrypoint/post-entrypoint.sh
+		`msg="hello post entrypoint\n" dryrun=false job=docker-with-pre-post/local jobID=local matrix="map[]" raw_output=true stage=Post`,
+		// Message from the runner
+		`msg="  ✅  Success - Post ./actions/docker-local-with-post-entrypoint" dryrun=false job=docker-with-pre-post/local jobID=local matrix="map[]" stage=Post`,
+	}
+
+	ctx := t.Context()
+
+	config := &Config{
+		ForceRebuild: true,
+	}
+
+	wf := TestJobFileInfo{
+		workdir:      workdir,
+		workflowPath: "docker-local-action-with-pre-post",
+		eventName:    "push",
+		platforms:    platforms,
+		secrets:      secrets,
+	}
+
+	logger := &maskJobLoggerFactory{}
+
+	wf.runTest(WithJobLoggerFactory(common.WithLogger(ctx, logger.WithJobLogger()), logger), t, config)
+
+	output := logger.Output.String()
+
+	for _, msg := range expectedLogMessages {
+		assert.Contains(t, output, msg, "did not find expected log message: "+msg)
+	}
+}
+
+func TestRunner_DockerActionWithPreAndPostRemote(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	skip.If(t, runtime.GOOS != "linux") // Windows and macOS cannot run linux docker container natively
+
+	expectedLogMessages := []string{
+		// stage=Pre
+		// The message from https://code.forgejo.org/forgejo/act-test-actions/src/commit/eca0f21772626c85cca7661bd25d93b45b847b94/runner-pre-post-entrypoint/pre-entrypoint#L3		i
+		`msg="docker image has prepared to do work\n" dryrun=false job=docker-with-pre-post/remote jobID=remote matrix="map[]" raw_output=true stage=Pre`,
+		// Message from the runner
+		`msg="  ✅  Success - Pre https://code.forgejo.org/forgejo/act-test-actions/runner-pre-post-entrypoint@main" dryrun=false job=docker-with-pre-post/remote jobID=remote matrix="map[]" stage=Pre`,
+
+		// stage=Main
+		// The message from https://code.forgejo.org/forgejo/act-test-actions/src/commit/eca0f21772626c85cca7661bd25d93b45b847b94/runner-pre-post-entrypoint/entrypoint#L3		i
+		`msg="docker image has done the work\n" dryrun=false job=docker-with-pre-post/remote jobID=remote matrix="map[]" raw_output=true stage=Main`,
+		// Message from the runner
+		`msg="  ✅  Success - Main https://code.forgejo.org/forgejo/act-test-actions/runner-pre-post-entrypoint@main" dryrun=false job=docker-with-pre-post/remote jobID=remote matrix="map[]" stage=Main`,
+
+		// stage=Post
+		// The message from https://code.forgejo.org/forgejo/act-test-actions/src/commit/eca0f21772626c85cca7661bd25d93b45b847b94/runner-pre-post-entrypoint/post-entrypoint#L3		i
+		`msg="docker image has cleaned up after work\n" dryrun=false job=docker-with-pre-post/remote jobID=remote matrix="map[]" raw_output=true stage=Post`,
+		// Message from the runner
+		`msg="  ✅  Success - Post https://code.forgejo.org/forgejo/act-test-actions/runner-pre-post-entrypoint@main" dryrun=false job=docker-with-pre-post/remote jobID=remote matrix="map[]" stage=Post`,
+	}
+
+	ctx := t.Context()
+
+	config := &Config{}
+
+	wf := TestJobFileInfo{
+		workdir:      workdir,
+		workflowPath: "docker-remote-action-with-pre-post",
+		eventName:    "push",
+		platforms:    platforms,
+		secrets:      secrets,
+	}
+
+	logger := &maskJobLoggerFactory{}
+
+	wf.runTest(WithJobLoggerFactory(common.WithLogger(ctx, logger.WithJobLogger()), logger), t, config)
+
+	output := logger.Output.String()
+
+	for _, msg := range expectedLogMessages {
+		assert.Contains(t, output, msg, "did not find expected log message: "+msg)
+	}
+}
