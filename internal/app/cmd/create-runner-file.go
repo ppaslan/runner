@@ -74,6 +74,7 @@ func ping(cfg *config.Config, reg *config.Registration) error {
 		"",
 		"",
 		ver.Version(),
+		cfg.Runner.FetchTimeout,
 	)
 
 	_, err := cli.Ping(context.Background(), connect.NewRequest(&pingv1.PingRequest{
@@ -144,6 +145,7 @@ func runCreateRunnerFile(ctx context.Context, args *createRunnerFileArgs, config
 				reg.UUID,
 				reg.Token,
 				ver.Version(),
+				cfg.Runner.FetchInterval,
 			)
 
 			runner := run.NewRunner(cfg, reg, cli)
