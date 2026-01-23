@@ -240,7 +240,12 @@ func setupPty(cmd *exec.Cmd) (*os.File, *os.File, error) {
 func copyPtyOutput(writer io.Writer, master io.Reader, finishLog context.CancelFunc, logger log.FieldLogger) {
 	_, err := io.Copy(writer, master)
 	if err != nil {
-		logger.Errorf("unexpected error handling command output: %w", err)
+		var pathErr *fs.PathError
+		// Typically io.Copy ends with an error reading /dev/ptmx, as a pty doesn't EOF like a normal file.
+		// This error specifically can be suppressed.
+		if !errors.As(err, &pathErr) || pathErr.Op != "read" || pathErr.Path != "/dev/ptmx" {
+			logger.Errorf("unexpected error handling command output: %w", err)
+		}
 	}
 	finishLog()
 }
@@ -288,7 +293,7 @@ func (e *HostEnvironment) exec(ctx context.Context, commandparam []string, cmdli
 			common.Logger(ctx).Debugf("execute in LXC container %v: %v", e.Name, command)
 
 			command = append([]string{
-				"/usr/bin/sudo", "--preserve-env",
+				"/usr/bin/sudo", "--preserve-env", "--preserve-env=PATH",
 				"/usr/bin/nsenter",
 				"--target", e.LXCPID,
 				"--all",                      // enter all the same namespaces as the target process
