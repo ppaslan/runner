@@ -114,3 +114,57 @@ func TestStepDockerPrePost(t *testing.T) {
 	err = sd.post()(ctx)
 	assert.Nil(t, err)
 }
+
+// TestStepDockerNetworkConfiguration tests that step containers are created with proper network configuration
+func TestStepDockerNetworkConfiguration(t *testing.T) {
+	var input *container.NewContainerInput
+
+	origContainerNewContainer := ContainerNewContainer
+	ContainerNewContainer = func(containerInput *container.NewContainerInput) container.ExecutionsEnvironment {
+		input = containerInput
+		return &containerMock{}
+	}
+	defer func() {
+		ContainerNewContainer = origContainerNewContainer
+	}()
+
+	ctx := t.Context()
+
+	cm := &containerMock{}
+	rc := &RunContext{
+		StepResults: map[string]*model.StepResult{},
+		Config:      &Config{Workdir: "/workspace"},
+		Run: &model.Run{
+			JobID: "test-job",
+			Workflow: &model.Workflow{
+				Jobs: map[string]*model.Job{
+					"test-job": {},
+				},
+			},
+		},
+		JobContainer: cm,
+	}
+
+	sd := &stepDocker{
+		RunContext: rc,
+		Step: &model.Step{
+			ID:   "test-step-1",
+			Uses: "docker://alpine:latest",
+		},
+		env: map[string]string{},
+	}
+
+	// Call newStepContainer directly to test network configuration
+	_ = sd.newStepContainer(ctx, "alpine:latest", nil, nil)
+
+	// Verify network configuration
+	// NetworkMode should use rc.getNetworkName() instead of container:jobContainerName
+	// This ensures the step container doesn't inherit the wrong hostname from job container
+	assert.NotEmpty(t, input.NetworkMode, "NetworkMode should be set")
+	assert.NotContains(t, input.NetworkMode, "container:", "NetworkMode should not use container: mode")
+
+	// Verify NetworkAliases is set with sanitized step ID
+	assert.NotNil(t, input.NetworkAliases, "NetworkAliases should be set")
+	assert.Len(t, input.NetworkAliases, 1, "Should have exactly one network alias")
+	assert.Equal(t, "test-step-1", input.NetworkAliases[0], "Network alias should be sanitized step ID")
+}
