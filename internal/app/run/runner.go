@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"path/filepath"
 	"strconv"
@@ -53,7 +54,7 @@ type RunnerInterface interface {
 	Run(ctx context.Context, task *runnerv1.Task) error
 }
 
-func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) *Runner {
+func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client, cacheProxy *cacheproxy.Handler) *Runner {
 	ls := labels.Labels{}
 	for _, v := range reg.Labels {
 		if l, err := labels.Parse(v); err == nil {
@@ -70,11 +71,8 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 	envs := make(map[string]string, len(cfg.Runner.Envs))
 	maps.Copy(envs, cfg.Runner.Envs)
 
-	var cacheProxy *cacheproxy.Handler
-	if cfg.Cache.Enabled == nil || *cfg.Cache.Enabled {
-		cacheProxy = setupCache(cfg, envs)
-	} else {
-		cacheProxy = nil
+	if cacheProxy != nil {
+		envs["ACTIONS_CACHE_URL"] = cacheProxy.ExternalURL()
 	}
 
 	artifactAPI := strings.TrimSuffix(cli.Address(), "/") + "/api/actions_pipeline/"
@@ -97,9 +95,10 @@ func NewRunner(cfg *config.Config, reg *config.Registration, cli client.Client) 
 	}
 }
 
-func setupCache(cfg *config.Config, envs map[string]string) *cacheproxy.Handler {
+func SetupCache(cfg *config.Config) *cacheproxy.Handler {
 	var cacheURL string
 	var cacheSecret string
+	var internalCacheServer io.Closer
 
 	if cfg.Cache.ExternalServer == "" {
 		// No external cache server was specified, start internal cache server
@@ -128,6 +127,7 @@ func setupCache(cfg *config.Config, envs map[string]string) *cacheproxy.Handler 
 		}
 
 		cacheURL = cacheServer.ExternalURL()
+		internalCacheServer = cacheServer
 	} else {
 		// An external cache server was specified, use its url
 		cacheSecret = cfg.Cache.Secret
@@ -147,11 +147,11 @@ func setupCache(cfg *config.Config, envs map[string]string) *cacheproxy.Handler 
 		cfg.Cache.ActionsCacheURLOverride,
 		cacheSecret,
 		log.StandardLogger().WithField("module", "cache_proxy"),
+		internalCacheServer,
 	)
 	if err != nil {
 		log.Errorf("cannot init cache proxy, cache will be disabled: %v", err)
-	} else {
-		envs["ACTIONS_CACHE_URL"] = cacheProxy.ExternalURL()
+		return nil
 	}
 
 	return cacheProxy
