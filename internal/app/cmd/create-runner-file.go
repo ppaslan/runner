@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"time"
 
 	pingv1 "code.forgejo.org/forgejo/actions-proto/ping/v1"
 	"connectrpc.com/connect"
@@ -17,6 +18,7 @@ import (
 	"code.forgejo.org/forgejo/runner/v12/internal/app/run"
 	"code.forgejo.org/forgejo/runner/v12/internal/pkg/client"
 	"code.forgejo.org/forgejo/runner/v12/internal/pkg/config"
+	"code.forgejo.org/forgejo/runner/v12/internal/pkg/labels"
 	"code.forgejo.org/forgejo/runner/v12/internal/pkg/ver"
 )
 
@@ -119,6 +121,7 @@ func runCreateRunnerFile(ctx context.Context, args *createRunnerFileArgs, config
 			UUID:    uuid,
 			Token:   args.Secret,
 			Address: args.InstanceAddr,
+			Labels:  cfg.Runner.DefaultLabels,
 		}
 
 		//
@@ -145,11 +148,11 @@ func runCreateRunnerFile(ctx context.Context, args *createRunnerFileArgs, config
 				reg.UUID,
 				reg.Token,
 				ver.Version(),
-				cfg.Runner.FetchInterval,
+				1*time.Second, // FetchInterval isn't defined in create-runner-file, but it's irrelevant since we're not going to start a poller
 			)
 
-			runner := run.NewRunner(cfg, reg, cli, nil)
-			resp, err := runner.Declare(ctx, cfg.Runner.Labels)
+			runner := run.NewRunner(cfg, reg.Name, labels.Labels{}, cli, nil)
+			resp, err := runner.Declare(ctx, reg.Labels)
 
 			if err != nil && connect.CodeOf(err) == connect.CodeUnimplemented {
 				log.Warn("Cannot verify the connection because the Forgejo instance is lower than v1.21")

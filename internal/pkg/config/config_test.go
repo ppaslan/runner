@@ -19,32 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestConfigTune(t *testing.T) {
-	c := &Config{
-		Runner: Runner{},
-	}
-
-	t.Run("Public instance tuning", func(t *testing.T) {
-		c.Runner.FetchInterval = 60 * time.Second
-		c.Tune("https://codeberg.org")
-		assert.EqualValues(t, 60*time.Second, c.Runner.FetchInterval)
-
-		c.Runner.FetchInterval = 2 * time.Second
-		c.Tune("https://codeberg.org")
-		assert.EqualValues(t, 30*time.Second, c.Runner.FetchInterval)
-	})
-
-	t.Run("Non-public instance tuning", func(t *testing.T) {
-		c.Runner.FetchInterval = 60 * time.Second
-		c.Tune("https://example.com")
-		assert.EqualValues(t, 60*time.Second, c.Runner.FetchInterval)
-
-		c.Runner.FetchInterval = 2 * time.Second
-		c.Tune("https://codeberg.com")
-		assert.EqualValues(t, 2*time.Second, c.Runner.FetchInterval)
-	})
-}
-
 func TestNew(t *testing.T) {
 	t.Run("Missing configuration file results in error", func(t *testing.T) {
 		config, err := New(FromFile("does-not-exist"))
@@ -76,7 +50,7 @@ func TestNew(t *testing.T) {
 
 		assert.Equal(t, 6, reflect.TypeOf(Config{}).NumField())
 		assert.Equal(t, 2, reflect.TypeOf(Log{}).NumField())
-		assert.Equal(t, 12, reflect.TypeOf(Runner{}).NumField())
+		assert.Equal(t, 11, reflect.TypeOf(Runner{}).NumField())
 		assert.Equal(t, 8, reflect.TypeOf(Cache{}).NumField())
 		assert.Equal(t, 9, reflect.TypeOf(Container{}).NumField())
 		assert.Equal(t, 1, reflect.TypeOf(Host{}).NumField())
@@ -93,9 +67,8 @@ func TestNew(t *testing.T) {
 		assert.Zero(t, config.Runner.ShutdownTimeout)
 		assert.False(t, config.Runner.Insecure)
 		assert.Equal(t, 5*time.Second, config.Runner.FetchTimeout)
-		assert.Equal(t, 2*time.Second, config.Runner.FetchInterval)
 		assert.Equal(t, 1*time.Second, config.Runner.ReportInterval)
-		assert.Empty(t, config.Runner.Labels)
+		assert.Empty(t, config.Runner.DefaultLabels)
 		assert.Equal(t, uint(10), config.Runner.ReportRetry.MaxRetries)
 		assert.Equal(t, 100*time.Millisecond, config.Runner.ReportRetry.InitialDelay)
 		assert.Zero(t, config.Runner.ReportRetry.MaxDelay)
@@ -141,7 +114,7 @@ func TestNew(t *testing.T) {
 
 		assert.Equal(t, 6, reflect.TypeOf(Config{}).NumField())
 		assert.Equal(t, 2, reflect.TypeOf(Log{}).NumField())
-		assert.Equal(t, 12, reflect.TypeOf(Runner{}).NumField())
+		assert.Equal(t, 11, reflect.TypeOf(Runner{}).NumField())
 		assert.Equal(t, 8, reflect.TypeOf(Cache{}).NumField())
 		assert.Equal(t, 9, reflect.TypeOf(Container{}).NumField())
 		assert.Equal(t, 1, reflect.TypeOf(Host{}).NumField())
@@ -158,9 +131,8 @@ func TestNew(t *testing.T) {
 		assert.Zero(t, config.Runner.ShutdownTimeout)
 		assert.False(t, config.Runner.Insecure)
 		assert.Equal(t, 5*time.Second, config.Runner.FetchTimeout)
-		assert.Equal(t, 2*time.Second, config.Runner.FetchInterval)
 		assert.Equal(t, 1*time.Second, config.Runner.ReportInterval)
-		assert.Empty(t, config.Runner.Labels)
+		assert.Empty(t, config.Runner.DefaultLabels)
 		assert.Equal(t, uint(10), config.Runner.ReportRetry.MaxRetries)
 		assert.Equal(t, 100*time.Millisecond, config.Runner.ReportRetry.InitialDelay)
 		assert.Zero(t, config.Runner.ReportRetry.MaxDelay)
@@ -188,6 +160,71 @@ func TestNew(t *testing.T) {
 		assert.True(t, filepath.IsAbs(config.Host.WorkdirParent))
 
 		assert.Empty(t, config.Server.Connections)
+	})
+
+	t.Run("Connection defaults configured", func(t *testing.T) {
+		rawConfig := `
+server:
+  connections:
+    example:
+      url: https://example.com/
+      uuid: 7f7695df-a064-4c70-a597-56714e851e2c
+      token: LxV7RrjXd
+      labels: ["docker:docker://node:current-bookworm"]
+    codeberg:
+      url: https://codeberg.org/
+      uuid: 33580597-5122-46f7-b997-ecc1e8ee8ffa
+      token: LxV7RrjXd
+      labels: ["docker:docker://node:current-bookworm"]
+`
+
+		tempDir := t.TempDir()
+
+		configPath := filepath.Join(tempDir, "config.yml")
+		err := os.WriteFile(configPath, []byte(rawConfig), 0o644)
+		require.NoError(t, err)
+
+		config, err := New(FromFile(configPath))
+		require.NoError(t, err)
+
+		require.Len(t, config.Server.Connections, 2)
+
+		c, ok := config.Server.Connections["example"]
+		require.True(t, ok)
+		assert.Equal(t, 2*time.Second, c.FetchInterval)
+
+		c, ok = config.Server.Connections["codeberg"]
+		require.True(t, ok)
+		assert.Equal(t, 30*time.Second, c.FetchInterval)
+	})
+
+	t.Run("Global connection overrides", func(t *testing.T) {
+		rawConfig := `
+runner:
+  fetch_interval: 14s
+  labels: ["docker:docker://node:current-bookworm"]
+server:
+  connections:
+    example:
+      url: https://example.com/
+      uuid: 7f7695df-a064-4c70-a597-56714e851e2c
+      token: LxV7RrjXd
+`
+
+		tempDir := t.TempDir()
+
+		configPath := filepath.Join(tempDir, "config.yml")
+		err := os.WriteFile(configPath, []byte(rawConfig), 0o644)
+		require.NoError(t, err)
+
+		config, err := New(FromFile(configPath))
+		require.NoError(t, err)
+
+		require.Len(t, config.Server.Connections, 1)
+		c, ok := config.Server.Connections["example"]
+		require.True(t, ok)
+		assert.Equal(t, 14*time.Second, c.FetchInterval)
+		assert.Len(t, c.Labels, 1)
 	})
 
 	t.Run("Configuration file takes precedence over defaults", func(t *testing.T) {
@@ -242,6 +279,7 @@ server:
       url: https://example.com/
       uuid: 7f7695df-a064-4c70-a597-56714e851e2c
       token: LxV7RrjXd
+      fetch_interval: 8s
       labels:
         - debian:docker://node:24-trixie
 `
@@ -260,7 +298,7 @@ server:
 
 		assert.Equal(t, 6, reflect.TypeOf(Config{}).NumField())
 		assert.Equal(t, 2, reflect.TypeOf(Log{}).NumField())
-		assert.Equal(t, 12, reflect.TypeOf(Runner{}).NumField())
+		assert.Equal(t, 11, reflect.TypeOf(Runner{}).NumField())
 		assert.Equal(t, 8, reflect.TypeOf(Cache{}).NumField())
 		assert.Equal(t, 9, reflect.TypeOf(Container{}).NumField())
 		assert.Equal(t, 1, reflect.TypeOf(Host{}).NumField())
@@ -289,12 +327,10 @@ server:
 		assert.True(t, config.Runner.Insecure)
 		assert.NotEqual(t, defaultConfig.Runner.FetchTimeout, config.Runner.FetchTimeout)
 		assert.Equal(t, 25*time.Second, config.Runner.FetchTimeout)
-		assert.NotEqual(t, defaultConfig.Runner.FetchInterval, config.Runner.FetchInterval)
-		assert.Equal(t, 8*time.Second, config.Runner.FetchInterval)
 		assert.NotEqual(t, defaultConfig.Runner.ReportInterval, config.Runner.ReportInterval)
 		assert.Equal(t, 5*time.Second, config.Runner.ReportInterval)
-		assert.NotEqual(t, defaultConfig.Runner.Labels, config.Runner.Labels)
-		assert.Equal(t, []string{"docker:docker://node:24-trixie"}, config.Runner.Labels)
+		assert.NotEqual(t, defaultConfig.Runner.DefaultLabels, config.Runner.DefaultLabels)
+		assert.Equal(t, []string{"docker:docker://node:24-trixie"}, config.Runner.DefaultLabels)
 		assert.NotEqual(t, defaultConfig.Runner.ReportRetry.MaxRetries, config.Runner.ReportRetry.MaxRetries)
 		assert.Equal(t, uint(26), config.Runner.ReportRetry.MaxRetries)
 		assert.NotEqual(t, defaultConfig.Runner.ReportRetry.InitialDelay, config.Runner.ReportRetry.InitialDelay)
@@ -347,6 +383,7 @@ server:
 		assert.Equal(t, "https://example.com/", config.Server.Connections["example"].URL.String())
 		assert.Equal(t, "7f7695df-a064-4c70-a597-56714e851e2c", config.Server.Connections["example"].UUID.String())
 		assert.Equal(t, "LxV7RrjXd", config.Server.Connections["example"].Token)
+		assert.Equal(t, 8*time.Second, config.Server.Connections["example"].FetchInterval)
 		assert.Len(t, config.Server.Connections["example"].Labels, 1)
 		assert.Equal(t, labels.MustParse("debian:docker://node:24-trixie"), config.Server.Connections["example"].Labels[0])
 	})
@@ -427,6 +464,47 @@ runner:
 		assert.Nil(t, config)
 		assert.ErrorContains(t, err, "could not read env file")
 	})
+
+	t.Run(".runner label overrides", func(t *testing.T) {
+		rawConfig := `
+runner:
+  fetch_interval: 14s
+  labels: ["docker:docker://node:current-bookworm"]
+`
+		tempDir := t.TempDir()
+
+		configPath := filepath.Join(tempDir, "config.yml")
+		err := os.WriteFile(configPath, []byte(rawConfig), 0o644)
+		require.NoError(t, err)
+
+		config, err := New(
+			FromFile(configPath),
+			func(config *Config) error {
+				if config.Server.Connections == nil {
+					config.Server.Connections = make(map[string]*Connection)
+				}
+				parsedURL, err := url.ParseRequestURI("https://example.com")
+				require.NoError(t, err)
+				config.Server.Connections["runner"] = &Connection{
+					URL:           parsedURL,
+					UUID:          gouuid.New(),
+					Token:         "token-goes-here",
+					Labels:        []*labels.Label{labels.MustParse("lxc:lxc://debian:bookworm")},
+					labelPriority: overrideIfPossible, // indicates that this label should be overridden
+				}
+				return nil
+			},
+		)
+		require.NoError(t, err)
+
+		require.Len(t, config.Server.Connections, 1)
+		c, ok := config.Server.Connections["runner"]
+		require.True(t, ok)
+		require.Len(t, c.Labels, 1)
+		assert.Equal(t, c.Labels[0].Name, "docker")
+		assert.Equal(t, c.Labels[0].Schema, "docker")
+		assert.Equal(t, c.Labels[0].Arg, "//node:current-bookworm")
+	})
 }
 
 func TestSerializedLogSettings_applyTo(t *testing.T) {
@@ -482,9 +560,8 @@ func TestSerializedRunnerSettings_applyTo(t *testing.T) {
 			ShutdownTimeout: 878 * time.Second,
 			Insecure:        true,
 			FetchTimeout:    299 * time.Second,
-			FetchInterval:   820 * time.Second,
 			ReportInterval:  868 * time.Second,
-			Labels:          []string{"label-1", "label-2"},
+			DefaultLabels:   []string{"label-1", "label-2"},
 			ReportRetry:     Retry{},
 		}
 
@@ -497,7 +574,6 @@ func TestSerializedRunnerSettings_applyTo(t *testing.T) {
 			ShutdownTimeout: 878 * time.Second,
 			Insecure:        true,
 			FetchTimeout:    299 * time.Second,
-			FetchInterval:   820 * time.Second,
 			ReportInterval:  868 * time.Second,
 			Labels:          []string{"label-1", "label-2"},
 			ReportRetry:     serializedReportRetrySettings{},
@@ -526,9 +602,8 @@ func TestSerializedRunnerSettings_applyTo(t *testing.T) {
 			ShutdownTimeout: 878 * time.Second,
 			Insecure:        true,
 			FetchTimeout:    299 * time.Second,
-			FetchInterval:   820 * time.Second,
 			ReportInterval:  868 * time.Second,
-			Labels:          []string{"label-1", "label-2"},
+			DefaultLabels:   []string{"label-1", "label-2"},
 			ReportRetry:     Retry{},
 		}
 
@@ -564,9 +639,8 @@ func TestSerializedRunnerSettings_applyTo(t *testing.T) {
 			ShutdownTimeout: 878 * time.Second,
 			Insecure:        true,
 			FetchTimeout:    299 * time.Second,
-			FetchInterval:   820 * time.Second,
 			ReportInterval:  868 * time.Second,
-			Labels:          []string{"label-1", "label-2"},
+			DefaultLabels:   []string{"label-1", "label-2"},
 			ReportRetry:     Retry{},
 		}
 
@@ -700,11 +774,11 @@ func TestSerializedRunnerSettings_applyTo(t *testing.T) {
 			ReportRetry:     serializedReportRetrySettings{},
 		}
 
-		config := Config{Runner: Runner{FetchInterval: 0}}
-		err := settings.applyTo(&config)
+		config := Config{Server: Server{Connections: map[string]*Connection{"default": {}}}}
+		err := settings.applyGlobalDefaultsTo(&config)
 		require.NoError(t, err)
 
-		assert.Equal(t, 0*time.Second, config.Runner.FetchInterval)
+		assert.Equal(t, 0*time.Second, config.Server.Connections["default"].FetchInterval)
 	})
 
 	t.Run("ignores invalid report_interval", func(t *testing.T) {
@@ -970,7 +1044,7 @@ func TestSerializedServerSettings_applyTo(t *testing.T) {
 		require.NoError(t, err)
 
 		expected := Server{
-			Connections: map[string]Connection{
+			Connections: map[string]*Connection{
 				"example": {
 					URL:    serverURL,
 					UUID:   gouuid.MustParse("4f79bf07-38f6-44c8-bbc6-d6531134f16a"),
@@ -1023,7 +1097,7 @@ func TestSerializedConnectionSettings_applyTo(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Len(t, config.Server.Connections, 1)
-		assert.Equal(t, expected, config.Server.Connections["example"])
+		assert.Equal(t, &expected, config.Server.Connections["example"])
 	})
 
 	t.Run("rejects missing url", func(t *testing.T) {
@@ -1105,21 +1179,6 @@ func TestSerializedConnectionSettings_applyTo(t *testing.T) {
 
 		err = serialized.applyTo(&Config{}, "example")
 		assert.ErrorContains(t, err, "`token` is empty")
-	})
-
-	t.Run("rejects missing labels", func(t *testing.T) {
-		serverURL, err := url.Parse("https://example.com/")
-		require.NoError(t, err)
-
-		serialized := serializedConnectionSettings{
-			URL:    serverURL.String(),
-			UUID:   "54d7e9a6-0b44-4d81-8948-50c1dd351d19",
-			Token:  "Shoi0zUBg6P",
-			Labels: nil,
-		}
-
-		err = serialized.applyTo(&Config{}, "example")
-		assert.ErrorContains(t, err, "at least one `label` is required")
 	})
 
 	t.Run("rejects malformed label", func(t *testing.T) {

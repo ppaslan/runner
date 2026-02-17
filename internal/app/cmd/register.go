@@ -154,9 +154,9 @@ func (r *registerInputs) assignToNext(stage registerStage, value string, cfg *co
 	case StageInputRunnerName:
 		r.RunnerName = value
 		// if there are some labels configured in config file, skip input labels stage
-		if len(cfg.Runner.Labels) > 0 {
-			ls := make([]string, 0, len(cfg.Runner.Labels))
-			for _, l := range cfg.Runner.Labels {
+		if len(cfg.Runner.DefaultLabels) > 0 {
+			ls := make([]string, 0, len(cfg.Runner.DefaultLabels))
+			for _, l := range cfg.Runner.DefaultLabels {
 				_, err := labels.Parse(l)
 				if err != nil {
 					log.WithError(err).Warnf("ignored invalid label %q", l)
@@ -266,11 +266,11 @@ func registerNoInteractive(ctx context.Context, configFile string, regArgs *regi
 		inputs.Labels = commaSplit(regArgs.Labels)
 	}
 	// specify labels in config file.
-	if len(cfg.Runner.Labels) > 0 {
+	if len(cfg.Runner.DefaultLabels) > 0 {
 		if regArgs.Labels != "" {
 			log.Warn("Labels from command will be ignored, use labels defined in config file.")
 		}
-		inputs.Labels = cfg.Runner.Labels
+		inputs.Labels = cfg.Runner.DefaultLabels
 	}
 
 	if inputs.RunnerName == "" {
@@ -296,7 +296,7 @@ func doRegister(ctx context.Context, cfg *config.Config, inputs *registerInputs)
 		"",
 		"",
 		ver.Version(),
-		cfg.Runner.FetchInterval,
+		1*time.Second, // FetchInterval isn't defined in register, but it's irrelevant since we're not going to start a poller
 	)
 
 	for {
@@ -323,11 +323,10 @@ func doRegister(ctx context.Context, cfg *config.Config, inputs *registerInputs)
 	}
 
 	reg := &config.Registration{
-		Name:      inputs.RunnerName,
-		Token:     inputs.Token,
-		Address:   inputs.InstanceAddr,
-		Labels:    inputs.Labels,
-		Ephemeral: inputs.Ephemeral,
+		Name:    inputs.RunnerName,
+		Token:   inputs.Token,
+		Address: inputs.InstanceAddr,
+		Labels:  inputs.Labels,
 	}
 
 	ls := make([]string, len(reg.Labels))
@@ -342,7 +341,7 @@ func doRegister(ctx context.Context, cfg *config.Config, inputs *registerInputs)
 		Version:     ver.Version(),
 		AgentLabels: ls, // Could be removed after Gitea 1.20
 		Labels:      ls,
-		Ephemeral:   reg.Ephemeral,
+		Ephemeral:   inputs.Ephemeral,
 	}))
 	if err != nil {
 		log.WithError(err).Error("poller: cannot register new runner")
@@ -353,7 +352,6 @@ func doRegister(ctx context.Context, cfg *config.Config, inputs *registerInputs)
 	reg.UUID = resp.Msg.GetRunner().GetUuid()
 	reg.Name = resp.Msg.GetRunner().GetName()
 	reg.Token = resp.Msg.GetRunner().GetToken()
-	reg.Ephemeral = resp.Msg.GetRunner().GetEphemeral()
 
 	if inputs.Ephemeral != resp.Msg.GetRunner().GetEphemeral() {
 		return fmt.Errorf("This Forgejo instance does not support ephemeral runners; requires Forgejo 15 or newer. The runner was registered as a non-ephemeral runner instead. Please manually delete the runner '%s' from the Forgejo UI to avoid a stale runner entry", reg.Name)
