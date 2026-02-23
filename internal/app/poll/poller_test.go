@@ -102,38 +102,19 @@ func (o *mockClient) FetchTask(ctx context.Context, req *connect.Request[runnerv
 }
 
 type mockRunner struct {
-	cfg    *config.Runner
-	log    chan string
-	panics bool
-	err    error
+	cfg *config.Runner
+	log chan string
 }
 
-func (o *mockRunner) Run(ctx context.Context, task *runnerv1.Task) error {
+func (o *mockRunner) Run(ctx context.Context, task *runnerv1.Task) {
 	o.log <- "runner starts"
-	if o.panics {
-		log.Trace("panics")
-		o.log <- "runner panics"
-		o.panics = false
-		panic("whatever")
-	}
-	if o.err != nil {
-		log.Trace("error")
-		o.log <- "runner error"
-		err := o.err
-		o.err = nil
-		return err
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			log.Trace("shutdown")
-			o.log <- "runner shutdown"
-			return nil
-		case <-time.After(o.cfg.Timeout):
-			log.Trace("after")
-			o.log <- "runner timeout"
-			return nil
-		}
+	select {
+	case <-ctx.Done():
+		log.Trace("shutdown")
+		o.log <- "runner shutdown"
+	case <-time.After(o.cfg.Timeout):
+		log.Trace("after")
+		o.log <- "runner timeout"
 	}
 }
 
@@ -158,8 +139,6 @@ func TestPoller_Runner(t *testing.T) {
 		name           string
 		timeout        time.Duration
 		noTask         bool
-		panics         bool
-		err            error
 		expected       string
 		contextTimeout time.Duration
 	}{
@@ -167,18 +146,6 @@ func TestPoller_Runner(t *testing.T) {
 			name:     "Simple",
 			timeout:  10 * time.Second,
 			expected: "runner shutdown",
-		},
-		{
-			name:     "Panics",
-			timeout:  10 * time.Second,
-			panics:   true,
-			expected: "runner panics",
-		},
-		{
-			name:     "Error",
-			timeout:  10 * time.Second,
-			err:      fmt.Errorf("ERROR"),
-			expected: "runner error",
 		},
 		{
 			name:     "PollTaskError",
@@ -209,10 +176,8 @@ func TestPoller_Runner(t *testing.T) {
 					noTask: testCase.noTask,
 				}},
 				[]run.RunnerInterface{&mockRunner{
-					cfg:    &configRunner,
-					log:    runnerLog,
-					panics: testCase.panics,
-					err:    testCase.err,
+					cfg: &configRunner,
+					log: runnerLog,
 				}})
 			go p.Poll()
 			assert.Equal(t, "runner starts", <-runnerLog)

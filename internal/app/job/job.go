@@ -49,21 +49,7 @@ func (j *Job) Run(ctx context.Context, wait bool) error {
 	if !ok {
 		return fmt.Errorf("could not fetch task")
 	}
-	return j.runTaskWithRecover(ctx, task)
-}
-
-func (j *Job) runTaskWithRecover(ctx context.Context, task *runnerv1.Task) error {
-	defer func() {
-		if r := recover(); r != nil {
-			err := fmt.Errorf("panic: %v", r)
-			log.WithError(err).Error("panic in runTaskWithRecover")
-		}
-	}()
-
-	if err := j.runner.Run(ctx, task); err != nil {
-		log.WithError(err).Error("failed to run task")
-		return err
-	}
+	j.runner.Run(ctx, task)
 	return nil
 }
 
