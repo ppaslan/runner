@@ -26,6 +26,7 @@ import (
 	"github.com/docker/cli/cli/connhelper"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/go-connections/nat"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/system"
@@ -232,7 +233,7 @@ func (cr *containerReference) GetContainerArchive(ctx context.Context, srcPath s
 }
 
 func (cr *containerReference) UpdateFromEnv(srcPath string, env *map[string]string) common.Executor {
-	return parseEnvFile(cr, srcPath, env).IfNot(common.Dryrun)
+	return ParseEnvFile(cr, srcPath, env).IfNot(common.Dryrun)
 }
 
 func (cr *containerReference) UpdateFromImageEnv(env *map[string]string) common.Executor {
@@ -630,11 +631,16 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 		isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
 		input := cr.input
 
+		exposedPorts := nat.PortSet{}
+		for port := range input.ExposedPorts {
+			exposedPorts[nat.Port(port)] = struct{}{}
+		}
+
 		config := &container.Config{
 			Image:        input.Image,
 			WorkingDir:   input.WorkingDir,
 			Env:          input.Env,
-			ExposedPorts: input.ExposedPorts,
+			ExposedPorts: exposedPorts,
 			Tty:          isTerminal,
 		}
 		logger.Debugf("Common container.Config ==> %+v", config)
@@ -670,6 +676,15 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 			}
 		}
 
+		portBindings := nat.PortMap{}
+		for port, bindings := range input.PortBindings {
+			natBindings := make([]nat.PortBinding, len(bindings))
+			for i, b := range bindings {
+				natBindings[i] = nat.PortBinding{HostIP: b.HostIP, HostPort: b.HostPort}
+			}
+			portBindings[nat.Port(port)] = natBindings
+		}
+
 		hostConfig := &container.HostConfig{
 			CapAdd:       capAdd,
 			CapDrop:      capDrop,
@@ -678,7 +693,7 @@ func (cr *containerReference) create(capAdd, capDrop []string) common.Executor {
 			NetworkMode:  container.NetworkMode(input.NetworkMode),
 			Privileged:   input.Privileged,
 			UsernsMode:   container.UsernsMode(input.UsernsMode),
-			PortBindings: input.PortBindings,
+			PortBindings: portBindings,
 		}
 		logger.Debugf("Common container.HostConfig ==> %+v", hostConfig)
 
